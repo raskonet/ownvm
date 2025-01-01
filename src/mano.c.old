@@ -1,0 +1,707 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+
+// Define types
+typedef unsigned short int Word;        // 16-bit word
+typedef unsigned short int Address;     // 12-bit address
+typedef unsigned short int Opcode;      // 4-bit opcode (includes I bit)
+typedef unsigned char Byte;             // 8-bit byte
+
+// Memory size: 4096 words of 16 bits each
+#define MEMORY_SIZE 4096
+
+// Register and bus definitions
+typedef enum {
+    BUS_NONE = 0x00,
+    BUS_S0 = 0x01,
+    BUS_S1 = 0x02,
+    BUS_S2 = 0x04,
+    BUS_MEMORY = BUS_S0,              // Memory to Bus
+    BUS_PC = BUS_S1,                  // PC to Bus
+    BUS_AR = BUS_S2,                  // AR to Bus
+    BUS_DR = BUS_S1 | BUS_S0,         // DR to Bus
+    BUS_AC = BUS_S2 | BUS_S0,         // AC to Bus
+    BUS_IR = BUS_S2 | BUS_S1,         // IR to Bus
+    BUS_TR = BUS_S2 | BUS_S1 | BUS_S0 // TR to Bus
+} BusSelect;
+
+// Register load/clear/increment control signals
+typedef enum {
+    LD_AR = 0x0001,
+    LD_PC = 0x0002,
+    LD_DR = 0x0004,
+    LD_AC = 0x0008,
+    LD_IR = 0x0010,
+    LD_TR = 0x0020,
+    LD_INPR = 0x0040,
+    LD_OUTR = 0x0080,
+    INR_SC = 0x0100,
+    CLR_SC = 0x0200,
+    INR_PC = 0x0400,
+    CLR_PC = 0x0800,
+    INR_AR = 0x1000,
+    CLR_AR = 0x2000,
+    CLR_E = 0x4000
+} ControlSignals;
+
+// Opcode definitions (first 3 bits)
+#define OP_AND  0x0 // AND Memory to AC
+#define OP_ADD  0x1 // Add Memory to AC
+#define OP_LDA  0x2 // Load Memory to AC
+#define OP_STA  0x3 // Store AC to Memory
+#define OP_BUN  0x4 // Branch unconditionally
+#define OP_BSA  0x5 // Branch and save return address
+#define OP_ISZ  0x6 // Increment and skip if zero
+
+// Register reference instructions (when opcode is 7)
+#define OP_REG  0x7
+#define CLA     0x800 // Clear AC
+#define CLE     0x400 // Clear E
+#define CMA     0x200 // Complement AC
+#define CME     0x100 // Complement E
+#define CIR     0x080 // Circulate right
+#define CIL     0x040 // Circulate left
+#define INC     0x020 // Increment AC
+#define SPA     0x010 // Skip if positive AC
+#define SNA     0x008 // Skip if negative AC
+#define SZA     0x004 // Skip if zero AC
+#define SZE     0x002 // Skip if zero E
+#define HLT     0x001 // Halt
+
+// I/O instructions (when opcode is 7 and bit 11 is 1)
+#define OP_IO   0x7
+#define IO_BIT  0x800 // I/O instruction flag
+#define INP     0x400 // Input
+#define OUT     0x200 // Output
+#define SKI     0x100 // Skip on input flag
+#define SKO     0x080 // Skip on output flag
+#define ION     0x040 // Interrupt on
+#define IOF     0x020 // Interrupt off
+
+// Indirect addressing bit (bit 15 of instruction)
+#define I_BIT   0x8000
+
+// Basic Computer Registers
+typedef struct {
+    Word AR;       // Address Register (12 bits)
+    Word PC;       // Program Counter (12 bits)
+    Word DR;       // Data Register (16 bits)
+    Word AC;       // Accumulator (16 bits)
+    Word IR;       // Instruction Register (16 bits)
+    Word TR;       // Temporary Register (16 bits)
+    Word INPR;     // Input Register (8 bits)
+    Word OUTR;     // Output Register (8 bits)
+    Byte SC;       // Sequence Counter (0-15)
+    Byte E;        // Extended Accumulator Bit (carry)
+    bool S;        // Start-Stop
+    bool R;        // Interrupt
+    bool IEN;      // Interrupt Enable
+    bool FGI;      // Input Flag
+    bool FGO;      // Output Flag
+} Registers;
+
+// Complete Basic Computer
+typedef struct {
+    Word memory[MEMORY_SIZE];  // Main memory (4096 words)
+    Registers reg;             // CPU registers
+    bool running;              // VM status
+    bool debug;                // Debug mode flag
+    Word data_bus;             // Common data bus
+    BusSelect bus_select;      // Bus source selection
+    ControlSignals ctrl;       // Control signals
+} BasicComputer;
+
+// Function prototypes
+void initialize_computer(BasicComputer *bc);
+bool execute_cycle(BasicComputer *bc);
+void instruction_cycle(BasicComputer *bc);
+void interrupt_cycle(BasicComputer *bc);
+Word read_memory(BasicComputer *bc, Address addr);
+void write_memory(BasicComputer *bc, Address addr, Word data);
+void dump_registers(BasicComputer *bc);
+void dump_memory(BasicComputer *bc, Address start, Address end);
+void load_program(BasicComputer *bc, Word *program, int size);
+void run_computer(BasicComputer *bc);
+void print_instruction(Word instruction);
+void execute_control_signals(BasicComputer *bc);
+void evaluate_bus(BasicComputer *bc);
+void register_reference_execution(BasicComputer *bc);
+void io_execution(BasicComputer *bc);
+void memory_reference_execution(BasicComputer *bc);
+
+// Initialize the computer
+void initialize_computer(BasicComputer *bc) {
+    memset(bc->memory, 0, sizeof(bc->memory));
+    bc->reg.AR = 0;
+    bc->reg.PC = 0;
+    bc->reg.DR = 0;
+    bc->reg.AC = 0;
+    bc->reg.IR = 0;
+    bc->reg.TR = 0;
+    bc->reg.INPR = 0;
+    bc->reg.OUTR = 0;
+    bc->reg.SC = 0;
+    bc->reg.E = 0;
+    bc->reg.S = true;     // Start computer
+    bc->reg.R = false;    // No interrupt
+    bc->reg.IEN = false;  // Interrupts disabled
+    bc->reg.FGI = false;  // No input ready
+    bc->reg.FGO = true;   // Output ready
+    bc->running = true;
+    bc->debug = false;
+    bc->data_bus = 0;
+    bc->bus_select = BUS_NONE;
+    bc->ctrl = 0;
+}
+
+// Read from memory
+Word read_memory(BasicComputer *bc, Address addr) {
+    addr &= 0x0FFF; // Ensure address is 12 bits
+    return bc->memory[addr];
+}
+
+// Write to memory
+void write_memory(BasicComputer *bc, Address addr, Word data) {
+    addr &= 0x0FFF; // Ensure address is 12 bits
+    bc->memory[addr] = data;
+}
+
+// Evaluate the bus value based on bus select lines
+void evaluate_bus(BasicComputer *bc) {
+    // Select the source based on bus select lines S2, S1, and S0
+    switch (bc->bus_select) {
+        case BUS_MEMORY:
+            bc->data_bus = read_memory(bc, bc->reg.AR);
+            break;
+        case BUS_PC:
+            bc->data_bus = bc->reg.PC;
+            break;
+        case BUS_AR:
+            bc->data_bus = bc->reg.AR;
+            break;
+        case BUS_DR:
+            bc->data_bus = bc->reg.DR;
+            break;
+        case BUS_AC:
+            bc->data_bus = bc->reg.AC;
+            break;
+        case BUS_IR:
+            bc->data_bus = bc->reg.IR;
+            break;
+        case BUS_TR:
+            bc->data_bus = bc->reg.TR;
+            break;
+        case BUS_NONE:
+        default:
+            // Bus is not driven by any source
+            bc->data_bus = 0;
+            break;
+    }
+    
+    if (bc->debug) {
+        printf("Bus: S2=%d S1=%d S0=%d Value=0x%04X\n", 
+               (bc->bus_select & BUS_S2) ? 1 : 0,
+               (bc->bus_select & BUS_S1) ? 1 : 0, 
+               (bc->bus_select & BUS_S0) ? 1 : 0,
+               bc->data_bus);
+    }
+}
+
+// Execute control signals
+void execute_control_signals(BasicComputer *bc) {
+    // Load registers from the bus if the corresponding load signals are active
+    if (bc->ctrl & LD_AR) {
+        bc->reg.AR = bc->data_bus & 0x0FFF; // 12-bit address
+    }
+    
+    if (bc->ctrl & LD_PC) {
+        bc->reg.PC = bc->data_bus & 0x0FFF; // 12-bit address
+    }
+    
+    if (bc->ctrl & LD_DR) {
+        bc->reg.DR = bc->data_bus;
+    }
+    
+    if (bc->ctrl & LD_AC) {
+        bc->reg.AC = bc->data_bus;
+    }
+    
+    if (bc->ctrl & LD_IR) {
+        bc->reg.IR = bc->data_bus;
+    }
+    
+    if (bc->ctrl & LD_TR) {
+        bc->reg.TR = bc->data_bus;
+    }
+    
+    if (bc->ctrl & LD_INPR) {
+        bc->reg.INPR = bc->data_bus & 0xFF; // 8-bit input
+    }
+    
+    if (bc->ctrl & LD_OUTR) {
+        bc->reg.OUTR = bc->data_bus & 0xFF; // 8-bit output
+    }
+    
+    // Clear registers if the corresponding clear signals are active
+    if (bc->ctrl & CLR_SC) {
+        bc->reg.SC = 0;
+    }
+    
+    if (bc->ctrl & CLR_PC) {
+        bc->reg.PC = 0;
+    }
+    
+    if (bc->ctrl & CLR_AR) {
+        bc->reg.AR = 0;
+    }
+    
+    if (bc->ctrl & CLR_E) {
+        bc->reg.E = 0;
+    }
+    
+    // Increment registers if the corresponding increment signals are active
+    if (bc->ctrl & INR_SC) {
+        bc->reg.SC = (bc->reg.SC + 1) & 0x0F; // 4-bit counter (0-15)
+    }
+    
+    if (bc->ctrl & INR_PC) {
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF; // 12-bit counter
+    }
+    
+    if (bc->ctrl & INR_AR) {
+        bc->reg.AR = (bc->reg.AR + 1) & 0x0FFF; // 12-bit counter
+    }
+    
+    // Reset control signals after execution
+    bc->ctrl = 0;
+    
+    if (bc->debug) {
+        printf("Control signals executed, SC=%d\n", bc->reg.SC);
+    }
+}
+
+// Execute a single clock cycle (micro-operation)
+bool execute_cycle(BasicComputer *bc) {
+    // First, increment the sequence counter
+    bc->ctrl |= INR_SC;
+    
+    // Check if interrupt cycle should be executed
+    if (bc->reg.R && bc->reg.IEN && bc->reg.SC == 0) {
+        // Execute interrupt cycle
+        interrupt_cycle(bc);
+        return true;
+    }
+    
+    // Execute the appropriate micro-operation based on sequence counter
+    switch (bc->reg.SC) {
+        case 0: // T0: AR ← PC
+            if (bc->debug) printf("T0: AR ← PC\n");
+            bc->bus_select = BUS_PC;
+            evaluate_bus(bc);
+            bc->ctrl |= LD_AR;
+            break;
+            
+        case 1: // T1: IR ← M[AR], PC ← PC + 1
+            if (bc->debug) printf("T1: IR ← M[AR], PC ← PC + 1\n");
+            bc->bus_select = BUS_MEMORY;
+            evaluate_bus(bc);
+            bc->ctrl |= LD_IR;
+            bc->ctrl |= INR_PC;
+            break;
+            
+        case 2: // T2: Decode IR and determine action
+            if (bc->debug) printf("T2: Decode IR\n");
+            // No specific registers are loaded at this stage
+            // D0, D1, D2, etc. would be determined by hardware decoding
+            if ((bc->reg.IR >> 12) == OP_REG) { 
+                if (bc->reg.IR & IO_BIT) {
+                    // I/O instruction
+                    io_execution(bc);
+                } else {
+                    // Register reference instruction
+                    register_reference_execution(bc);
+                }
+                // For register reference instructions, next cycle back to T0
+                bc->ctrl |= CLR_SC;
+            } else {
+                // Memory reference instruction - proceed to next micro-operation
+                // If indirect bit is set, we need to fetch the actual address
+                if (bc->reg.IR & I_BIT) {
+                    // D3,I: AR ← M[AR]
+                    bc->reg.AR = bc->reg.IR & 0x0FFF;
+                    bc->bus_select = BUS_MEMORY;
+                    evaluate_bus(bc);
+                    bc->ctrl |= LD_AR;
+                }
+            }
+            break;
+            
+        case 3: // T3: Memory reference execution
+            if (bc->debug) printf("T3: Execute memory reference\n");
+            memory_reference_execution(bc);
+            bc->ctrl |= CLR_SC; // Reset sequence counter for next instruction
+            break;
+            
+        default:
+            // For now, we'll just reset the sequence counter if it goes beyond our implemented stages
+            if (bc->debug) printf("Unimplemented sequence counter value: %d\n", bc->reg.SC);
+            bc->ctrl |= CLR_SC;
+            break;
+    }
+    
+    // Execute the control signals
+    execute_control_signals(bc);
+    return true;
+}
+
+// Register reference instruction execution
+void register_reference_execution(BasicComputer *bc) {
+    if (bc->debug) printf("Register reference execution: IR=0x%04X\n", bc->reg.IR);
+    
+    // Check each register reference bit and perform its operation
+    if (bc->reg.IR & CLA)
+        bc->reg.AC = 0;
+    
+    if (bc->reg.IR & CLE)
+        bc->reg.E = 0;
+    
+    if (bc->reg.IR & CMA)
+        bc->reg.AC = ~bc->reg.AC & 0xFFFF;
+    
+    if (bc->reg.IR & CME)
+        bc->reg.E = ~bc->reg.E & 0x1;
+    
+    if (bc->reg.IR & CIR) {
+        // Circulate right: AC gets right-shifted, LSB goes to E, E goes to MSB
+        Byte temp = bc->reg.E;
+        bc->reg.E = bc->reg.AC & 0x1;
+        bc->reg.AC = (bc->reg.AC >> 1) | (temp << 15);
+    }
+    
+    if (bc->reg.IR & CIL) {
+        // Circulate left: AC gets left-shifted, MSB goes to E, E goes to LSB
+        Byte temp = bc->reg.E;
+        bc->reg.E = (bc->reg.AC >> 15) & 0x1;
+        bc->reg.AC = ((bc->reg.AC << 1) | temp) & 0xFFFF;
+    }
+    
+    if (bc->reg.IR & INC)
+        bc->reg.AC = (bc->reg.AC + 1) & 0xFFFF;
+    
+    if ((bc->reg.IR & SPA) && ((bc->reg.AC & 0x8000) == 0))
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if ((bc->reg.IR & SNA) && (bc->reg.AC & 0x8000))
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if ((bc->reg.IR & SZA) && (bc->reg.AC == 0))
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if ((bc->reg.IR & SZE) && (bc->reg.E == 0))
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if (bc->reg.IR & HLT) {
+        bc->running = false;
+        printf("Computer halted at PC=0x%03X\n", bc->reg.PC);
+    }
+}
+
+// I/O instruction execution
+void io_execution(BasicComputer *bc) {
+    if (bc->debug) printf("I/O execution: IR=0x%04X\n", bc->reg.IR);
+    
+    // Check each I/O bit and perform its operation
+    if (bc->reg.IR & INP) {
+        // Input character from keyboard (simulated)
+        printf("Enter a character: ");
+        int ch = getchar();
+        while (getchar() != '\n'); // Clear input buffer
+        bc->reg.INPR = ch & 0xFF;
+        bc->reg.AC = (bc->reg.AC & 0xFF00) | bc->reg.INPR;
+        bc->reg.FGI = false;
+    }
+    
+    if (bc->reg.IR & OUT) {
+        // Output character to display (simulated)
+        bc->reg.OUTR = bc->reg.AC & 0xFF;
+        printf("Output: %c (0x%02X)\n", (char)bc->reg.OUTR, bc->reg.OUTR);
+        bc->reg.FGO = false;
+    }
+    
+    if ((bc->reg.IR & SKI) && bc->reg.FGI)
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if ((bc->reg.IR & SKO) && bc->reg.FGO)
+        bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+    
+    if (bc->reg.IR & ION)
+        bc->reg.IEN = true;
+    
+    if (bc->reg.IR & IOF)
+        bc->reg.IEN = false;
+}
+
+// Memory reference instruction execution
+void memory_reference_execution(BasicComputer *bc) {
+    Opcode opcode = (bc->reg.IR >> 12) & 0x7; // First 3 bits of IR (excluding I bit)
+    
+    // AR should already be set to the operand address (either direct or indirect)
+    Address operand_address = bc->reg.AR & 0x0FFF;
+    
+    if (bc->debug) {
+        printf("Memory reference execution: Opcode=%d, Address=0x%03X\n", opcode, operand_address);
+    }
+    
+    // Fetch the operand from memory into DR for operations that need it
+    if (opcode != OP_STA && opcode != OP_BUN && opcode != OP_BSA) {
+        bc->reg.DR = read_memory(bc, operand_address);
+        if (bc->debug) printf("Fetched operand: DR=0x%04X\n", bc->reg.DR);
+    }
+    
+    // Execute based on opcode
+    switch (opcode) {
+        case OP_AND: // AND memory word to AC
+            bc->reg.AC &= bc->reg.DR;
+            break;
+            
+        case OP_ADD: // Add memory word to AC
+            {
+                Word result = bc->reg.AC + bc->reg.DR;
+                bc->reg.E = (result >> 16) & 0x1; // Capture carry
+                bc->reg.AC = result & 0xFFFF;     // Keep 16 bits
+            }
+            break;
+            
+        case OP_LDA: // Load memory word to AC
+            bc->reg.AC = bc->reg.DR;
+            break;
+            
+        case OP_STA: // Store AC in memory
+            write_memory(bc, operand_address, bc->reg.AC);
+            break;
+            
+        case OP_BUN: // Branch unconditionally
+            bc->reg.PC = operand_address;
+            break;
+            
+        case OP_BSA: // Branch and save return address
+            write_memory(bc, operand_address, bc->reg.PC);
+            bc->reg.PC = (operand_address + 1) & 0x0FFF;
+            break;
+            
+        case OP_ISZ: // Increment and skip if zero
+            bc->reg.DR = (bc->reg.DR + 1) & 0xFFFF;
+            write_memory(bc, operand_address, bc->reg.DR);
+            if (bc->reg.DR == 0)
+                bc->reg.PC = (bc->reg.PC + 1) & 0x0FFF;
+            break;
+    }
+    
+    if (bc->debug) {
+        printf("After execution: AC=0x%04X, E=%d, PC=0x%03X\n", 
+               bc->reg.AC, bc->reg.E, bc->reg.PC);
+    }
+}
+
+// Interrupt cycle
+void interrupt_cycle(BasicComputer *bc) {
+    if (bc->debug) printf("Interrupt cycle\n");
+    
+    // R=1, IEN=1 at SC=0 triggers interrupt cycle
+    switch (bc->reg.SC) {
+        case 0: // T0: AR ← 0, TR ← PC
+            bc->reg.TR = bc->reg.PC;
+            bc->reg.AR = 0;
+            break;
+            
+        case 1: // T1: M[AR] ← TR, PC ← 0
+            write_memory(bc, bc->reg.AR, bc->reg.TR);
+            bc->reg.PC = 0;
+            break;
+            
+        case 2: // T2: PC ← PC + 1, IEN ← 0, R ← 0, SC ← 0
+            bc->reg.PC = 1;
+            bc->reg.IEN = false;
+            bc->reg.R = false;
+            bc->ctrl |= CLR_SC;
+            break;
+    }
+}
+
+// Print human-readable representation of an instruction
+void print_instruction(Word instruction) {
+    Opcode opcode = (instruction >> 12) & 0x7;
+    bool indirect = (instruction & I_BIT) != 0;
+    Word operand = instruction & 0x0FFF;
+    
+    printf("[%s] ", indirect ? "I" : " ");
+    
+    switch (opcode) {
+        case OP_AND: printf("AND 0x%03X", operand); break;
+        case OP_ADD: printf("ADD 0x%03X", operand); break;
+        case OP_LDA: printf("LDA 0x%03X", operand); break;
+        case OP_STA: printf("STA 0x%03X", operand); break;
+        case OP_BUN: printf("BUN 0x%03X", operand); break;
+        case OP_BSA: printf("BSA 0x%03X", operand); break;
+        case OP_ISZ: printf("ISZ 0x%03X", operand); break;
+        case OP_REG:
+            if (instruction & IO_BIT) {
+                // I/O instruction
+                printf("I/O: ");
+                if (instruction & INP) printf("INP ");
+                if (instruction & OUT) printf("OUT ");
+                if (instruction & SKI) printf("SKI ");
+                if (instruction & SKO) printf("SKO ");
+                if (instruction & ION) printf("ION ");
+                if (instruction & IOF) printf("IOF ");
+            } else {
+                // Register reference instruction
+                printf("REG: ");
+                if (instruction & CLA) printf("CLA ");
+                if (instruction & CLE) printf("CLE ");
+                if (instruction & CMA) printf("CMA ");
+                if (instruction & CME) printf("CME ");
+                if (instruction & CIR) printf("CIR ");
+                if (instruction & CIL) printf("CIL ");
+                if (instruction & INC) printf("INC ");
+                if (instruction & SPA) printf("SPA ");
+                if (instruction & SNA) printf("SNA ");
+                if (instruction & SZA) printf("SZA ");
+                if (instruction & SZE) printf("SZE ");
+                if (instruction & HLT) printf("HLT ");
+            }
+            break;
+    }
+}
+
+// Dump register contents
+void dump_registers(BasicComputer *bc) {
+    printf("PC=0x%03X AR=0x%03X IR=0x%04X AC=0x%04X DR=0x%04X TR=0x%04X\n", 
+           bc->reg.PC, bc->reg.AR, bc->reg.IR, bc->reg.AC, bc->reg.DR, bc->reg.TR);
+    printf("E=%d SC=%d S=%d R=%d IEN=%d FGI=%d FGO=%d\n",
+           bc->reg.E, bc->reg.SC, bc->reg.S, bc->reg.R, bc->reg.IEN, bc->reg.FGI, bc->reg.FGO);
+}
+
+// Dump memory contents
+void dump_memory(BasicComputer *bc, Address start, Address end) {
+    printf("Memory Dump [0x%03X - 0x%03X]:\n", start, end);
+    for (Address addr = start; addr <= end; addr++) {
+        if (addr % 8 == 0) {
+            printf("\n0x%03X: ", addr);
+        }
+        printf("%04X ", bc->memory[addr]);
+    }
+    printf("\n");
+}
+
+// Load program into memory
+void load_program(BasicComputer *bc, Word *program, int size) {
+    for (int i = 0; i < size; i++) {
+        bc->memory[i] = program[i];
+    }
+}
+
+// Run the computer
+void run_computer(BasicComputer *bc) {
+    bc->running = true;
+    
+    // Reset sequence counter at the beginning
+    bc->ctrl |= CLR_SC;
+    execute_control_signals(bc);
+    
+    while (bc->running) {
+        execute_cycle(bc);
+        
+        // Simulate an interrupt after some number of instructions (for testing)
+        // bc->reg.R = (bc->reg.PC % 10 == 0); // Generate interrupt every 10 instructions
+    }
+}
+
+// Example program: Add two numbers and halt
+Word example_program[] = {
+    0x2010,  // LDA 0x010    ; Load value from address 0x010
+    0x1011,  // ADD 0x011    ; Add value from address 0x011
+    0x3012,  // STA 0x012    ; Store result at address 0x012
+    0x7001,  // HLT          ; Halt
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x000A,  // Value 10 at address 0x010
+    0x0014,  // Value 20 at address 0x011
+    0x0000   // Result will be stored here at address 0x012
+};
+
+// Example program with register reference and I/O instructions
+Word example_program2[] = {
+    0x2010,  // LDA 0x010    ; Load value from address 0x010
+    0x7020,  // INC          ; Increment AC
+    0x7400,  // CLE          ; Clear E bit
+    0x7100,  // CME          ; Complement E bit
+    0x7200,  // CMA          ; Complement AC
+    0x7040,  // CIL          ; Circulate left
+    0x3011,  // STA 0x011    ; Store result
+    0x7001,  // HLT          ; Halt
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x0000,  // Padding
+    0x000A,  // Value 10 at address 0x010
+    0x0000   // Result will be stored here at address 0x011
+};
+
+int main(int argc, char *argv[]) {
+    BasicComputer bc;
+    initialize_computer(&bc);
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            bc.debug = true;
+        }
+    }
+    
+    // Choose which example program to run
+    int program_choice = 1;
+    if (argc > 1 && strcmp(argv[1], "2") == 0) {
+        program_choice = 2;
+    }
+    
+    if (program_choice == 1) {
+        // Load example program 1 (memory reference instructions)
+        load_program(&bc, example_program, sizeof(example_program) / sizeof(Word));
+    } else {
+        // Load example program 2 (register reference instructions)
+        load_program(&bc, example_program2, sizeof(example_program2) / sizeof(Word));
+    }
+    
+    printf("Morris Mano Basic Computer VM\n");
+    printf("Memory size: %d words\n", MEMORY_SIZE);
+    printf("Word size: 16 bits\n");
+    printf("Address size: 12 bits\n");
+    printf("Running example program %d...\n", program_choice);
+
+// Run the computer
+    run_computer(&bc);
+    
+    // Show results
+    printf("\nFinal state:\n");
+    dump_registers(&bc);
+    dump_memory(&bc, 0x010, 0x012);
+    
+    return 0;
+}
